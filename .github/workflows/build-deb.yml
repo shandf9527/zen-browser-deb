@@ -1,0 +1,127 @@
+name: build zen deb
+
+on:
+  schedule:
+    # Every day at 03:17 UTC (11:17 Asia/Shanghai).
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Zen version to build (blank = latest upstream release)"
+        required: false
+        default: ""
+      force:
+        description: "Rebuild even if a release for this version already exists"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-deb
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      UPSTREAM: zen-browser/desktop
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve upstream version
+        id: resolve
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          if [ -n "${INPUT_VERSION}" ]; then
+            tag="${INPUT_VERSION}"
+          else
+            tag="$(gh api "repos/${UPSTREAM}/releases/latest" --jq .tag_name)"
+          fi
+          [ -n "$tag" ] && [ "$tag" != "null" ] || { echo "cannot resolve version"; exit 1; }
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "resolved upstream tag: $tag"
+
+      - name: Skip if this version is already published
+        id: check
+        env:
+          TAG: ${{ steps.resolve.outputs.tag }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          set -euo pipefail
+          if [ "${FORCE}" = "true" ]; then
+            echo "force rebuild requested"
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "release $TAG already exists, nothing to do"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Download official Linux tarballs
+        if: steps.check.outputs.skip != 'true'
+        env:
+          TAG: ${{ steps.resolve.outputs.tag }}
+        run: |
+          set -euo pipefail
+          mkdir -p dl
+          gh release download "$TAG" --repo "$UPSTREAM" -D dl \
+            --pattern 'zen.linux-x86_64.tar.xz' \
+            --pattern 'zen.linux-aarch64.tar.xz'
+          ls -lh dl
+
+      - name: Build debs
+        if: steps.check.outputs.skip != 'true'
+        env:
+          TAG: ${{ steps.resolve.outputs.tag }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          ./build-deb.sh --version "$TAG" --arch amd64 --tarball dl/zen.linux-x86_64.tar.xz --outdir dist
+          ./build-deb.sh --version "$TAG" --arch arm64 --tarball dl/zen.linux-aarch64.tar.xz --outdir dist
+          cd dist && sha256sum ./*.deb > SHA256SUMS && cd ..
+          ls -lh dist
+          dpkg-deb -I dist/zen-browser_${TAG}_amd64.deb
+
+      - name: Publish release
+        if: steps.check.outputs.skip != 'true'
+        env:
+          TAG: ${{ steps.resolve.outputs.tag }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          body="$(gh api "repos/${UPSTREAM}/releases/tags/${TAG}" --jq .body || true)"
+          {
+            echo "Automated Debian package of the **official** Zen Browser ${TAG} Linux build."
+            echo
+            echo "No source compilation: the upstream tarball is repackaged as-is into \`/opt/zen-browser\`,"
+            echo "with a desktop entry, hicolor icons and a \`/usr/bin/zen-browser\` symlink added."
+            echo
+            echo "| file | arch |"
+            echo "|---|---|"
+            echo "| \`zen-browser_${TAG}_amd64.deb\` | x86_64 |"
+            echo "| \`zen-browser_${TAG}_arm64.deb\` | aarch64 |"
+            echo
+            echo "Install:"
+            echo '```bash'
+            echo "sudo apt install ./zen-browser_${TAG}_amd64.deb"
+            echo '```'
+            echo
+            echo "Upstream release notes:"
+            echo
+            echo "${body}"
+          } > notes.md
+          gh release create "$TAG" dist/*.deb dist/SHA256SUMS \
+            --repo "$REPO" \
+            --target "$GITHUB_SHA" \
+            --title "Zen Browser ${TAG} (deb)" \
+            --notes-file notes.md
+          gh release view "$TAG" --repo "$REPO" --json url --jq .url
